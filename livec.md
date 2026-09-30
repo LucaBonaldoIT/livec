@@ -79,7 +79,7 @@ C++ project files and headers
        └──── reflection registry
 ```
 
-Every discovered defined function receives a stable dispatch stub. A source edit recompiles the project into a candidate version; compatible implementations are then published to their stubs. Failed compilation retains the last valid version. Function signatures, type layouts, and existing object storage are validated before publication.
+Every discovered defined function receives a stable dispatch stub. Each ABI signature has its own dispatch identity, including signatures whose C++ mangled names collide because the return type changed. A source edit recompiles the project into a candidate version; valid implementation versions are published transactionally. Failed compilation retains the last valid version. Type layouts and existing object storage are validated before publication.
 
 The runner watches C++ source and header files under the project root. No application-specific file watcher, reload target, or listener is required.
 
@@ -91,7 +91,7 @@ The runner watches C++ source and header files under the project root. No applic
 - The compiler inserts version checks at loop back-edges. An active loop whose function changed tail-calls the new implementation at its next back-edge, passing the original parameters.
 - Automatic local variables are reinitialized when that function refreshes. Globals and compatible heap objects remain alive.
 - An invocation without a loop safepoint can finish on its old version. Variadic, `noreturn`, `naked`, exception-cleanup, and nontrivial-local-destructor functions do not receive the loop-refresh transformation yet.
-- Existing function ABI changes and live object-layout changes are rejected. Reflection does not make it safe to reinterpret existing objects with a different layout.
+- A changed function signature receives a separate dispatch identity. New callers compiled against the new declaration use the new version; callers that still have the old declaration/frame remain on the old ABI version. Update declarations across the project to migrate call sites. Live object-layout changes are rejected; reflection does not make it safe to reinterpret existing objects with a different layout.
 - C++ static initialization runs for the initial JIT load. Existing global objects are not reconstructed on reload; newly added globals with dynamic initializers are not yet supported.
 
 This is live code replacement, not arbitrary stack-frame migration. Local state migration, virtual/member-function pointer adapters, and safe reclamation of old code versions remain future work.
@@ -117,7 +117,7 @@ Run `make demo-reflection`. The example reflects and calls a native `add` functi
 - The entry point must be `int main()`.
 - Projects are rebuilt as a unit after source/header edits; dependency-aware incremental compilation is future work.
 - Function/type/global reflection is based on Clang-emitted debug metadata. Template-heavy standard-library metadata may be large; public reflection filters to definitions originating under the project root.
-- Existing ABI/layout changes are rejected. New dynamic C++ global initializers, full exception/RTTI behavior across reloads, arbitrary `std::function` invocation, and object migration need further work.
+- Live object-layout changes are rejected. New dynamic C++ global initializers, exception/RTTI behavior across reloads, arbitrary `std::function` invocation, and object migration need further work.
 - Old code versions are retained while the runtime is alive, so repeated reloads currently use additional memory.
 
 ---

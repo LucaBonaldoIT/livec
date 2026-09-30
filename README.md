@@ -54,7 +54,7 @@ Run the complete reflection example with `make demo-reflection`. A native free f
 - The entry point must be `int main()`.
 - At loop back-edges, an active function whose implementation changed tail-calls its new version with the original parameters. Its automatic locals are reinitialized; globals and compatible C++ objects persist. Functions without loop safepoints finish their current invocation on the old version.
 - Functions with C++ exception cleanups or nontrivial local destructors do not receive active-loop migration yet; their current invocation finishes on the old version.
-- Existing function ABI and object-layout changes are rejected. New C++ static initializers are not rerun on reload.
+- Function signature changes get a distinct dispatch identity, so new callers compiled against the new signature use its implementation while old-ABI callers keep the old version. Update declarations in the relevant headers/translation units; live object-layout changes are rejected. New C++ static initializers are not rerun on reload.
 - Translation units are rebuilt together after each change; old code versions are retained for safe active calls.
 
 See [`livec.md`](livec.md) for the language contract and roadmap.

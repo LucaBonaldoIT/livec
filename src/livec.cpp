@@ -93,6 +93,7 @@ struct Options {
 
 struct FunctionUpdate {
     std::string stableName;
+    std::string dispatchKey;
     std::string implementationName;
     std::string signature;
     std::string body;
@@ -131,6 +132,11 @@ struct FieldMetadata {
     bool isBitfield = false;
 };
 
+struct MethodMetadata {
+    std::string name;
+    std::string signature;
+};
+
 struct TypeMetadata {
     std::string id;
     std::string name;
@@ -139,7 +145,7 @@ struct TypeMetadata {
     size_t size = 0;
     size_t alignment = 0;
     std::vector<FieldMetadata> fields;
-    std::vector<std::string> methods;
+    std::vector<MethodMetadata> methods;
 };
 
 struct PersistentGlobal {
@@ -157,7 +163,9 @@ struct GlobalStage {
 struct Compilation {
     std::vector<std::unique_ptr<llvm::LLVMContext>> contexts;
     std::vector<std::unique_ptr<llvm::Module>> modules;
+    std::vector<fs::path> moduleSources;
     std::vector<FunctionUpdate> functions;
+    std::map<std::string, std::string> dispatchNames;
     std::map<std::string, VariableMetadata> variableMetadata;
     std::map<std::string, TypeMetadata> types;
 };
@@ -349,6 +357,32 @@ static std::string functionFingerprint(const llvm::Function &function) {
            std::to_string(function.getCallingConv()) + ":attrs=" + out.str();
 }
 
+static std::string sourcePath(const fs::path &source);
+
+static std::string functionABIKey(const std::string &linkName,
+                                  const llvm::Function &function,
+                                  const fs::path &source) {
+    std::string attributes;
+    const auto functionAttributes = function.getAttributes();
+    attributes = functionAttributes.getRetAttrs().getAsString();
+    for (unsigned index = 0; index < function.arg_size(); ++index) {
+        attributes += "|";
+        attributes += functionAttributes.getParamAttrs(index).getAsString();
+    }
+
+    std::string key;
+    if (function.hasLocalLinkage()) key = sourcePath(source) + "\n";
+    key += linkName + "\n" + typeFingerprint(function.getFunctionType()) +
+           "\ncc=" + std::to_string(function.getCallingConv()) + "\n" + attributes;
+    return key;
+}
+
+static std::string stableFunctionName(const std::string &linkName,
+                                      const std::string &dispatchKey) {
+    if (linkName == "main") return "main";
+    return "__livec_fn_" + hexHash(dispatchKey);
+}
+
 static std::string debugTypeName(const llvm::DIType *type, unsigned depth = 0) {
     if (!type) return "void";
     if (depth > 12) return "...";
@@ -418,6 +452,22 @@ static std::string debugFunctionSignature(const llvm::Function &function) {
     } else if (first) {
         result += "void";
     }
+    result += ")";
+    return result;
+}
+
+static std::string debugSubroutineSignature(const llvm::DISubroutineType &subroutine) {
+    llvm::DITypeRefArray types = subroutine.getTypeArray();
+    if (types.size() == 0) return "unknown";
+    std::string result = debugTypeName(types[0]) + " (";
+    bool first = true;
+    for (unsigned index = 1; index < types.size(); ++index) {
+        if (!types[index]) continue;
+        if (!first) result += ", ";
+        result += debugTypeName(types[index]);
+        first = false;
+    }
+    if (first) result += "void";
     result += ")";
     return result;
 }
@@ -508,10 +558,9 @@ static TypeMetadata describeType(const llvm::DICompositeType &type,
                 field->isBitField()
             });
         } else if (auto *method = llvm::dyn_cast<llvm::DISubprogram>(element)) {
-            const std::string key = method->getLinkageName().empty()
-                ? qualifiedFunctionName(*method)
-                : method->getLinkageName().str();
-            result.methods.push_back(key);
+            const std::string signature = method->getType()
+                ? debugSubroutineSignature(*method->getType()) : "unknown";
+            result.methods.push_back({qualifiedFunctionName(*method), signature});
         }
     }
     return result;
@@ -673,10 +722,6 @@ static bool compileToBitcode(const fs::path &source, const fs::path &output,
     return runProcess(command) == 0;
 }
 
-static std::string staticFunctionName(const fs::path &source, const std::string &name) {
-    return "__livec_static_fn_" + hexHash(source.string()) + "_" + symbolPart(name);
-}
-
 static std::string staticGlobalName(const fs::path &source, const std::string &name) {
     return "__livec_static_global_" + hexHash(source.string()) + "_" + symbolPart(name);
 }
@@ -813,7 +858,10 @@ public:
             }
             candidate.contexts.push_back(std::move(context));
             candidate.modules.push_back(std::move(module));
+            candidate.moduleSources.push_back(source);
         }
+
+        rewriteFunctionDeclarations(candidate);
 
         for (const auto &[name, layout] : stagedLayouts) {
             std::shared_lock metadataLock(reflectionMutex);
@@ -916,6 +964,8 @@ public:
                 typeMetadata[id] = metadata;
                 activeTypes.insert(id);
             }
+            for (const auto &[key, stableName] : candidate.dispatchNames)
+                functionDispatchNames[key] = stableName;
         }
         if (generation == 1) {
             if (auto error = jit->initialize(jit->getMainJITDylib())) {
@@ -1108,10 +1158,37 @@ public:
         std::shared_lock lock(reflectionMutex);
         auto metadata = typeMetadata.find(typeId);
         if (metadata == typeMetadata.end() || index >= metadata->second.methods.size()) return 0;
-        return fillFunctionInfo(metadata->second.methods[index], out);
+        const auto &method = metadata->second.methods[index];
+        for (const auto &stableName : activeFunctions) {
+            auto function = functionMetadata.find(stableName);
+            if (function != functionMetadata.end() && function->second.name == method.name &&
+                function->second.signature == method.signature)
+                return fillFunctionInfo(stableName, out);
+        }
+        return 0;
     }
 
 private:
+    void rewriteFunctionDeclarations(Compilation &candidate) {
+        std::map<std::string, std::string> dispatchNames;
+        {
+            std::shared_lock lock(reflectionMutex);
+            dispatchNames = functionDispatchNames;
+        }
+        dispatchNames.insert(candidate.dispatchNames.begin(), candidate.dispatchNames.end());
+        for (size_t moduleIndex = 0; moduleIndex < candidate.modules.size(); ++moduleIndex) {
+            llvm::Module &module = *candidate.modules[moduleIndex];
+            const fs::path &source = candidate.moduleSources[moduleIndex];
+            for (llvm::Function &function : module) {
+                if (!function.isDeclaration() || function.isIntrinsic()) continue;
+                const std::string name = function.getName().str();
+                if (name == "main" || llvm::StringRef(name).starts_with("__livec_fn_")) continue;
+                auto dispatch = dispatchNames.find(functionABIKey(name, function, source));
+                if (dispatch != dispatchNames.end()) function.setName(dispatch->second);
+            }
+        }
+    }
+
     int fillFunctionInfo(const std::string &stableName, livec_function_info *out) {
         auto metadata = functionMetadata.find(stableName);
         if (metadata == functionMetadata.end()) return 0;
@@ -1361,9 +1438,8 @@ private:
         }
         for (llvm::Function *function : definitionsInModule) {
             const std::string originalName = function->getName().str();
-            const std::string stableName = function->hasLocalLinkage()
-                ? staticFunctionName(source, originalName)
-                : originalName;
+            const std::string dispatchKey = functionABIKey(originalName, *function, source);
+            const std::string stableName = stableFunctionName(originalName, dispatchKey);
             std::string displayName = originalName;
             std::string displaySignature = debugFunctionSignature(*function);
             std::string displaySource = sourcePath(source);
@@ -1377,6 +1453,7 @@ private:
                               pathIsWithin(fs::path(displaySource), root);
             }
             if (!reflectable) continue;
+            candidate.dispatchNames[dispatchKey] = stableName;
             if (stableName == "main" &&
                 (!function->getReturnType()->isIntegerTy(32) ||
                  function->getFunctionType()->getNumParams() != 0 ||
@@ -1437,7 +1514,8 @@ private:
             function->replaceAllUsesWith(dispatchDeclaration);
             instrumentLoopSafepoints(*function, module, *dispatchDeclaration,
                                      hashString(stableName), generation);
-            candidate.functions.push_back({stableName, implementationName, signature, body, publish,
+            candidate.functions.push_back({stableName, dispatchKey, implementationName,
+                                            signature, body, publish,
                                             weakODR, displayName, displaySignature, displaySource,
                                             line, reflectable});
         }
@@ -1480,6 +1558,7 @@ private:
     std::set<std::string> activeFunctions;
     std::map<std::string, std::string> functionSignatures;
     std::map<std::string, std::string> functionBodies;
+    std::map<std::string, std::string> functionDispatchNames;
     std::map<std::string, FunctionMetadata> functionMetadata;
     std::map<std::string, PersistentGlobal> persistentGlobals;
     std::set<std::string> activeTypes;

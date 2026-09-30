@@ -22,6 +22,9 @@ float my_sqrt(float x) {
 }
 
 
+auto func() {
+    return 3.f;
+}
 
 int main() {
 
@@ -44,10 +47,17 @@ int main() {
         //printf("sono aaalucaaasda\n");
 
 
-        auto addFunction = livec::function(nameof(my_sqrt));
+        // auto addFunction = livec::function(nameof(my_sqrt));
 
-        std::cout << " function: " << addFunction.name << " " << addFunction.signature << '\n';
+        // std::cout << " function: " << addFunction.name << " " << addFunction.signature << '\n';
 
+
+        auto funcInfo = livec::function(nameof(func));
+
+
+        std::cout << func() << "(1): " << funcInfo.signature << std::endl;
+        std::cout << func() << "(2): " << funcInfo.signature << std::endl;
+        std::cout << func() << "(3): " << funcInfo.signature << std::endl;
 
         std::fflush(stdout);
 

@@ -138,6 +138,43 @@ def main():
         finally:
             stop_process(process)
 
+        signature_root = root / "signature-change"
+        signature_root.mkdir()
+        signature_header = signature_root / "measure.hpp"
+        signature_header.write_text("float measure(float);\n")
+        (signature_root / "main.cpp").write_text(
+            "#include <cstdio>\n"
+            "#include <unistd.h>\n"
+            "#include \"measure.hpp\"\n"
+            "int main() {\n"
+            "    for (;;) {\n"
+            "        double result = measure(2.0f);\n"
+            "        std::printf(\"result=%.1f\\n\", result);\n"
+            "        std::fflush(stdout);\n"
+            "        sleep(1);\n"
+            "    }\n"
+            "}\n"
+        )
+        measure_source = signature_root / "measure.cpp"
+        measure_source.write_text("float measure(float value) { return value * 2.0f; }\n")
+        process, output, logs = start_process(executable, signature_root, signature_root / "main.cpp")
+        try:
+            wait_for_line(logs, lambda line: "Program running" in line)
+            wait_for_line(output, lambda line: line.strip() == "result=4.0")
+            measure_source.write_text("double measure(float value) { return value * 10.0; }\n")
+            wait_for_line(logs, lambda line: "JIT installed version 2" in line)
+            old_caller = wait_for_line(output, lambda line: line.strip() == "result=4.0")
+            assert old_caller.strip() == "result=4.0", old_caller
+
+            # Keep the old call-site ABI until its declaration is edited too.
+            signature_header.write_text("double measure(float);\n")
+            wait_for_line(logs, lambda line: "JIT installed version 3" in line)
+            changed_signature = wait_for_line(output, lambda line: line.strip() == "result=20.0")
+            assert changed_signature.strip() == "result=20.0", changed_signature
+            print("PASS: C++ signature changes keep old ABI callers safe and update rebuilt callers")
+        finally:
+            stop_process(process)
+
         reflection_root = root / "reflection"
         reflection_root.mkdir()
         reflection_main = reflection_root / "main.cpp"
